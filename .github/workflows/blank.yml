@@ -1,0 +1,183 @@
+name: Enhanced Ubuntu VPS with Dual Ngrok Accounts
+
+on:
+  workflow_dispatch:
+    inputs:
+      uptime:
+        description: 'VPS uptime in hours (max 6)'
+        required: false
+        default: '6'
+        type: choice
+        options:
+        - '1'
+        - '2'
+        - '3'
+        - '4'
+        - '5'
+        - '6'
+
+jobs:
+  start-vps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies & Ngrok
+        run: |
+          sudo apt update -y
+          sudo apt install -y unzip curl jq openssh-server python3 python3-pip wget software-properties-common gnupg ufw
+
+          # Install latest Chrome
+          wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt install -y ./google-chrome-stable_current_amd64.deb || sudo apt --fix-broken install -y
+          rm google-chrome-stable_current_amd64.deb
+
+          # Install Python dependencies
+          python3 -m pip install --upgrade pip
+          pip3 install undetected-chromedriver selenium
+
+          # Ngrok setup
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install -y ngrok
+
+      - name: Configure SSH for Root Access
+        run: |
+          echo "root:password" | sudo chpasswd
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl enable ssh
+          sudo service ssh restart
+
+      - name: Configure Firewall and Open Ports
+        run: |
+          sudo ufw allow 22
+          sudo ufw allow 6667/tcp
+          sudo ufw --force enable
+
+      - name: Authenticate Primary Ngrok (SSH)
+        run: ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Start Ngrok TCP Tunnels
+        run: |
+          # Start SSH tunnel with primary account
+          nohup ngrok tcp 22 > ngrok_ssh.log &
+          sleep 5
+          
+          # Get SSH tunnel info
+          curl -s http://127.0.0.1:4040/api/tunnels > tunnels.json
+          SSH_HOST=$(jq -r '.tunnels[] | select(.proto == "tcp" and .config.addr == "localhost:22") | .public_url' tunnels.json)
+          SSH_IP=$(echo $SSH_HOST | cut -d ':' -f 2 | sed 's|//||')
+          SSH_PORT=$(echo $SSH_HOST | cut -d ':' -f 3)
+          
+          # Get public IP
+          PUBLIC_IP=$(curl -s ifconfig.me)
+          
+          echo "================ VPS CONNECTION INFO ================"
+          echo "🌐 Public IP Address: $PUBLIC_IP"
+          echo ""
+          echo "🔗 SSH Connection:"
+          echo "   Command: ssh root@$SSH_IP -p $SSH_PORT"
+          echo "   Password: password"
+          echo ""
+          echo "💻 Preinstalled: Chrome, Python, undetected_chromedriver"
+          echo "⏰ Uptime: ${{ github.event.inputs.uptime }} hours (auto-terminate after that)"
+          echo "======================================================"
+          
+          # Save connection info to file
+          cat > connection_info.txt << EOF
+          ================ VPS CONNECTION INFO ================
+          Public IP Address: $PUBLIC_IP
+          
+          SSH Connection:
+            Command: ssh root@$SSH_IP -p $SSH_PORT
+            Password: password
+          
+          Preinstalled: Chrome, Python, undetected_chromedriver
+          Uptime: ${{ github.event.inputs.uptime }} hours
+          
+          Note: After SSH connection, run:
+            ./setup_cnc_port.sh
+          
+          to configure CNC server port with second Ngrok account
+          ======================================================
+          EOF
+
+      - name: Upload Connection Info
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-connection-info
+          path: connection_info.txt
+
+      - name: Create CNC Setup Script
+        run: |
+          cat > setup_cnc_port.sh << 'EOF'
+          #!/bin/bash
+          echo "Setting up CNC server port with secondary Ngrok account..."
+          
+          if [ -z "$NGROK_CNC_TOKEN" ]; then
+            echo "ERROR: Please set your secondary Ngrok token first:"
+            echo "export NGROK_CNC_TOKEN=your_ngrok_token_here"
+            exit 1
+          fi
+          
+          # Authenticate with secondary Ngrok account
+          ngrok config add-authtoken $NGROK_CNC_TOKEN
+          
+          # Kill any existing ngrok processes using the secondary account
+          pkill -f "ngrok tcp 6667" || true
+          sleep 2
+          
+          # Start tunnel for CNC port 6667
+          echo "Starting tunnel for port 6667 with secondary Ngrok account..."
+          nohup ngrok tcp 6667 > ngrok_cnc_6667.log &
+          
+          sleep 5
+          
+          # Get tunnel information
+          curl -s http://127.0.0.1:4040/api/tunnels > cnc_tunnels.json
+          
+          PORT6667_HOST=$(jq -r '.tunnels[] | select(.config.addr == "localhost:6667") | .public_url' cnc_tunnels.json 2>/dev/null || echo "")
+          
+          if [ -z "$PORT6667_HOST" ] || [ "$PORT6667_HOST" == "null" ]; then
+            echo "ERROR: Failed to create tunnel for port 6667"
+            echo "Please check your Ngrok token and try again"
+            exit 1
+          fi
+          
+          PORT6667_IP=$(echo $PORT6667_HOST | cut -d ':' -f 2 | sed 's|//||')
+          PORT6667_PORT=$(echo $PORT6667_HOST | cut -d ':' -f 3)
+          
+          echo "================ CNC SERVER PORT ================"
+          echo "🚀 Open TCP Port (Secondary Ngrok Account):"
+          echo "   Port 6667: $PORT6667_IP:$PORT6667_PORT"
+          echo ""
+          echo "✨ UWU Enabled! (◕‿◕✿)"
+          echo "=================================================="
+          
+          # Save CNC info to file
+          cat > cnc_port_info.txt << EOC
+          ================ CNC SERVER PORT ================
+          Port 6667: $PORT6667_IP:$PORT6667_PORT
+          =================================================
+          EOC
+          
+          echo "CNC port information saved to cnc_port_info.txt"
+          echo "Your CNC server should be accessible at: tcp://$PORT6667_IP:$PORT6667_PORT"
+          EOF
+          
+          chmod +x setup_cnc_port.sh
+
+      - name: Upload CNC Setup Script
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnc-setup-script
+          path: setup_cnc_port.sh
+
+      - name: Keep VPS Alive
+        run: |
+          # Convert hours to seconds
+          UPTIME_SECONDS=$(( ${{ github.event.inputs.uptime }} * 3600 ))
+          echo "Keeping VPS alive for $UPTIME_SECONDS seconds (${{ github.event.inputs.uptime }} hours)"
+          sleep $UPTIME_SECONDS
